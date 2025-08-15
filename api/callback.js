@@ -13,7 +13,7 @@ function html(msg, color = "black", title = "Status") {
   </html>`;
 }
 
-// Minimal x-www-form-urlencoded parser for POST forms
+// Minimal x-www-form-urlencoded / JSON body parser for POST forms
 async function parseForm(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
@@ -44,7 +44,7 @@ module.exports = async (req, res) => {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") return res.status(200).end();
 
-  const APP_ID = process.env.INSTAGRAM_APP_ID;
+  const APP_ID = process.env.INSTAGRAM_APP_ID || "774904345078180";
   const APP_SECRET = process.env.INSTAGRAM_APP_SECRET;
   const ORBIT_UPDATE_URL = process.env.ORBIT_UPDATE_URL;
   const BASE44_API_KEY = process.env.BASE44_API_KEY;
@@ -229,13 +229,57 @@ module.exports = async (req, res) => {
       ));
     }
     const pages = Array.isArray(pagesRes.json?.data) ? pagesRes.json.data : [];
+
+    // 4b) If no pages, render re-consent helper with a button (auth_type=rerequest) + debug
     if (pages.length === 0) {
-      return res.status(400).send(html(
-        "No Pages returned for this user. Re‑consent with the required permissions and ensure your Facebook user has an Admin/Editor role on the Page. " +
-        "Permissions to request: <code>pages_show_list,pages_read_engagement,pages_manage_metadata,instagram_basic</code>.",
-        "red",
-        "❌ No Pages"
-      ));
+      // Build a re-consent URL that forces the user to click "Edit access"
+      const reconsent = new URL("https://www.facebook.com/v23.0/dialog/oauth");
+      reconsent.search = new URLSearchParams({
+        client_id: APP_ID,
+        redirect_uri: REDIRECT_URI,
+        scope: [
+          "pages_show_list",
+          "pages_read_engagement",
+          "pages_manage_metadata",
+          "instagram_basic",
+          "instagram_manage_insights",
+          "instagram_content_publish",
+        ].join(","),
+        response_type: "code",
+        auth_type: "rerequest",
+        state: JSON.stringify({ clientId }) // keep context
+      }).toString();
+
+      // Also show what the token actually has, to debug quickly
+      const perms2Resp = await fetch(`https://graph.facebook.com/v23.0/me/permissions?access_token=${encodeURIComponent(userAccessToken)}`);
+      const perms2Txt = await perms2Resp.text();
+      console.log("DEBUG me/permissions (No Pages branch):", perms2Txt);
+
+      return res.status(400).send(`
+        <html>
+          <body style="font-family: Arial, sans-serif; padding: 28px; max-width: 840px; margin: 0 auto;">
+            <h2 style="margin-top:0;">We kunnen je Facebook-pagina’s niet ophalen</h2>
+            <p>Dit gebeurt wanneer je token geen paginarechten heeft, of wanneer je geen <b>Facebook access: Full control</b> hebt op de pagina.</p>
+            <ol>
+              <li>Klik hieronder op <b>Toegang verlenen</b> en kies <b>Edit access / Toegang bewerken</b>.</li>
+              <li>Vink de juiste <b>Pagina’s</b> én het <b>Instagram-account</b> aan.</li>
+              <li>Probeer daarna opnieuw.</li>
+            </ol>
+
+            <p><a href="${reconsent.toString()}" style="display:inline-block;padding:10px 14px;border:1px solid #ddd;border-radius:8px;text-decoration:none;">🔁 Toegang verlenen</a></p>
+
+            <details style="margin-top:16px;">
+              <summary>Debug: me/permissions</summary>
+              <pre style="white-space:pre-wrap;border:1px solid #eee;padding:12px;border-radius:8px;">${String(perms2Txt).replace(/[<>]/g,"")}</pre>
+            </details>
+
+            <p style="font-size:12px;color:#666;margin-top:10px;">
+              Vereiste permissies: <code>pages_show_list, pages_read_engagement, pages_manage_metadata, instagram_basic</code>.<br>
+              Zorg dat je op de pagina <b>Facebook access: Full control</b> hebt (niet alleen "Task access").
+            </p>
+          </body>
+        </html>
+      `);
     }
 
     // 5) Build candidates: Pages that have IG (Business/Creator)
