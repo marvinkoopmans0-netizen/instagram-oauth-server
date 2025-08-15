@@ -1,4 +1,4 @@
-// /api/callback.js  (Vercel Serverless Function - CommonJS)
+// /api/callback.js (Vercel Serverless Function - CommonJS)
 
 function html(msg, color = "black", title = "Status") {
   return `
@@ -6,16 +6,14 @@ function html(msg, color = "black", title = "Status") {
     <body style="font-family: Arial, sans-serif; text-align:center; padding:40px;">
       <h1 style="color:${color};">${title}</h1>
       <p>${msg}</p>
-      <script>setTimeout(() => window.close(), 3000);</script>
+      <script>setTimeout(() => window.close(), 8000);</script>
     </body>
   </html>`;
 }
 
 function computeRedirectUri(req) {
-  // Prefer explicit env override
   if (process.env.REDIRECT_URI) return process.env.REDIRECT_URI;
 
-  // In Vercel, VERCEL_URL is like "myapp.vercel.app"
   const host = process.env.VERCEL_URL || req.headers.host;
   const proto = (req.headers["x-forwarded-proto"] || "https").split(",")[0].trim();
   return `${proto}://${host}/api/callback`;
@@ -33,6 +31,19 @@ module.exports = async (req, res) => {
   const { code, state, error } = req.query || {};
 
   if (error) {
+    // Special case: Show redirect URL if FB says domain not allowed
+    if (String(error).toLowerCase().includes("url isn't included")) {
+      const redirectUrl = computeRedirectUri(req);
+      return res.status(400).send(
+        html(
+          `❌ Domain not allowed in Facebook App.<br><br>
+          Add this URL to your <strong>Facebook App → Settings → Valid OAuth Redirect URIs</strong>:<br><br>
+          <code>${redirectUrl}</code>`,
+          "red",
+          "❌ App Domain Not Configured"
+        )
+      );
+    }
     return res
       .status(400)
       .send(html(`Authorization failed: ${String(error)}`, "red", "❌ Authorization Failed"));
@@ -44,7 +55,7 @@ module.exports = async (req, res) => {
       .send(html("Missing authorization code", "red", "❌ Missing Parameters"));
   }
 
-  // --- Required env ---
+  // --- Required env vars ---
   const APP_ID = process.env.INSTAGRAM_APP_ID;
   const APP_SECRET = process.env.INSTAGRAM_APP_SECRET;
   const ORBIT_UPDATE_URL = process.env.ORBIT_UPDATE_URL;
@@ -60,21 +71,20 @@ module.exports = async (req, res) => {
       .send(html("Server not configured: missing ORBIT_UPDATE_URL", "red", "❌ Server Misconfigured"));
   }
 
-  // --- Decode optional state ---
   let clientId = null;
   if (state) {
     try {
       const parsed = JSON.parse(decodeURIComponent(state));
       clientId = parsed.clientId || null;
     } catch {
-      // non-fatal
+      // ignore
     }
   }
 
   try {
     const redirectUri = computeRedirectUri(req);
 
-    // 1) Exchange code -> short-lived user access token (GET recommended)
+    // 1) Exchange code for short-lived token
     const params = new URLSearchParams({
       client_id: APP_ID,
       client_secret: APP_SECRET,
@@ -82,54 +92,66 @@ module.exports = async (req, res) => {
       code
     });
 
-    const tokenResp = await fetch(`https://graph.facebook.com/v19.0/oauth/access_token?${params.toString()}`);
+    const tokenResp = await fetch(`https://graph.facebook.com/v23.0/oauth/access_token?${params.toString()}`);
     const tokenJson = await tokenResp.json();
 
     if (!tokenResp.ok) {
-      const msg = tokenJson?.error?.message || "Token exchange failed";
-      throw new Error(`Token exchange failed: ${msg}`);
+      // Detect misconfigured redirect URI and show it
+      if (tokenJson?.error?.message?.toLowerCase().includes("url isn't included")) {
+        return res.status(400).send(
+          html(
+            `❌ Domain not allowed in Facebook App.<br><br>
+            Add this URL to your <strong>Facebook App → Settings → Valid OAuth Redirect URIs</strong>:<br><br>
+            <code>${redirectUri}</code>`,
+            "red",
+            "❌ App Domain Not Configured"
+          )
+        );
+      }
+      throw new Error(tokenJson?.error?.message || "Token exchange failed");
     }
 
     let userAccessToken = tokenJson.access_token;
 
-    // 2) Exchange to long-lived token (best practice)
+    // 2) Long-lived token
     const llParams = new URLSearchParams({
       grant_type: "fb_exchange_token",
       client_id: APP_ID,
       client_secret: APP_SECRET,
       fb_exchange_token: userAccessToken
     });
-    const llResp = await fetch(`https://graph.facebook.com/v19.0/oauth/access_token?${llParams.toString()}`);
+
+    const llResp = await fetch(`https://graph.facebook.com/v23.0/oauth/access_token?${llParams.toString()}`);
     const llJson = await llResp.json();
     if (llResp.ok && llJson.access_token) {
       userAccessToken = llJson.access_token;
     }
 
-    // 3) Fetch Pages the user manages
-    const pagesResp = await fetch(`https://graph.facebook.com/v19.0/me/accounts?access_token=${encodeURIComponent(userAccessToken)}`);
+    // 3) Fetch Pages
+    const pagesResp = await fetch(`https://graph.facebook.com/v23.0/me/accounts?access_token=${encodeURIComponent(userAccessToken)}`);
     const pagesJson = await pagesResp.json();
+
     if (!pagesResp.ok) {
-      const msg = pagesJson?.error?.message || "Failed to fetch pages";
-      throw new Error(msg);
+      throw new Error(pagesJson?.error?.message || "Failed to fetch pages");
     }
 
-    // 4) Find a Page that has an Instagram business account
+    // 4) Find IG business account
     let igAccount = null;
     let pageAccessToken = null;
     let igDetails = null;
 
     for (const page of pagesJson.data || []) {
       const igResp = await fetch(
-        `https://graph.facebook.com/v19.0/${page.id}?fields=instagram_business_account&access_token=${encodeURIComponent(page.access_token)}`
+        `https://graph.facebook.com/v23.0/${page.id}?fields=instagram_business_account&access_token=${encodeURIComponent(page.access_token)}`
       );
       const igJson = await igResp.json();
+
       if (igJson?.instagram_business_account?.id) {
         igAccount = igJson.instagram_business_account;
         pageAccessToken = page.access_token;
 
-        // Fetch IG username + avatar
         const detailsResp = await fetch(
-          `https://graph.facebook.com/v19.0/${igAccount.id}?fields=username,profile_picture_url&access_token=${encodeURIComponent(pageAccessToken)}`
+          `https://graph.facebook.com/v23.0/${igAccount.id}?fields=username,profile_picture_url&access_token=${encodeURIComponent(pageAccessToken)}`
         );
         igDetails = await detailsResp.json();
         break;
@@ -137,14 +159,14 @@ module.exports = async (req, res) => {
     }
 
     if (!igAccount) {
-      throw new Error("No Instagram Business Account found. Connect an Instagram Business Account to a Facebook Page you manage and try again.");
+      throw new Error("No Instagram Business Account found. Connect one to a Facebook Page and try again.");
     }
 
-    // 5) Notify your app (Orbit) with the connection info
+    // 5) Notify your app
     const payload = {
       client_id: clientId,
       instagram_account_id: igAccount.id,
-      instagram_access_token: pageAccessToken,      // Page token suitable for IG calls
+      instagram_access_token: pageAccessToken,
       instagram_account_name: igDetails?.username || null,
       instagram_profile_picture_url: igDetails?.profile_picture_url || null
     };
@@ -159,14 +181,13 @@ module.exports = async (req, res) => {
     });
 
     if (!updResp.ok) {
-      const t = await updResp.text();
-      throw new Error(`Failed to update main app: ${t}`);
+      throw new Error(`Failed to update main app: ${await updResp.text()}`);
     }
 
     return res
       .status(200)
       .send(html(
-        `Instagram account @${igDetails?.username || igAccount.id} connected. You can close this window.`,
+        `Instagram account @${igDetails?.username || igAccount.id} connected successfully.`,
         "green",
         "✅ Connected Successfully"
       ));
