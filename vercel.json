@@ -1,7 +1,7 @@
 {
   "functions": {
-    "api/callback.js": {
-      "runtime": "@vercel/node"
+    "api/*.js": {
+      "runtime": "vercel-node@3.0.0"
     }
   }
 }
