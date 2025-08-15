@@ -1,14 +1,22 @@
-// /api/callback.js  (Vercel Serverless Function - CommonJS)
+// /api/callback.js  (Vercel Serverless Function - CommonJS, Node runtime)
 
 function html(msg, color = "black", title = "Status") {
   return `
   <html>
     <body style="font-family: Arial, sans-serif; text-align:center; padding:40px;">
       <h1 style="color:${color};">${title}</h1>
-      <p>${msg}</p>
-      <script>setTimeout(() => window.close(), 4000);</script>
+      <div style="max-width:780px;margin:0 auto;text-align:left;">
+        ${msg}
+      </div>
+      <script>setTimeout(() => window.close(), 7000);</script>
     </body>
   </html>`;
+}
+
+function suggestUri(req) {
+  const host = process.env.VERCEL_URL || req.headers.host || "YOUR_DOMAIN.vercel.app";
+  const proto = (req.headers["x-forwarded-proto"] || "https").split(",")[0].trim();
+  return `${proto}://${host}/api/callback`;
 }
 
 module.exports = async (req, res) => {
@@ -38,22 +46,48 @@ module.exports = async (req, res) => {
   const APP_ID = process.env.INSTAGRAM_APP_ID;
   const APP_SECRET = process.env.INSTAGRAM_APP_SECRET;
   const ORBIT_UPDATE_URL = process.env.ORBIT_UPDATE_URL;
-  const REDIRECT_URI = process.env.REDIRECT_URI;
+  const REDIRECT_URI = process.env.REDIRECT_URI; // MUST be set exactly as this name
+
+  // Debug log for env visibility in Vercel logs
+  console.log("ENV scope:", process.env.VERCEL_ENV, "VERCEL_URL:", process.env.VERCEL_URL);
+  console.log("ENV has INSTAGRAM_APP_ID:", !!APP_ID, "INSTAGRAM_APP_SECRET:", !!APP_SECRET, "ORBIT_UPDATE_URL:", !!ORBIT_UPDATE_URL, "REDIRECT_URI:", !!REDIRECT_URI);
 
   if (!APP_ID || !APP_SECRET) {
     return res
       .status(500)
-      .send(html("Server not configured: missing INSTAGRAM_APP_ID/SECRET", "red", "❌ Server Misconfigured"));
+      .send(html(
+        "Server not configured: missing <code>INSTAGRAM_APP_ID</code> / <code>INSTAGRAM_APP_SECRET</code>.",
+        "red",
+        "❌ Server Misconfigured"
+      ));
   }
   if (!ORBIT_UPDATE_URL) {
     return res
       .status(500)
-      .send(html("Server not configured: missing ORBIT_UPDATE_URL", "red", "❌ Server Misconfigured"));
+      .send(html(
+        "Server not configured: missing <code>ORBIT_UPDATE_URL</code>.",
+        "red",
+        "❌ Server Misconfigured"
+      ));
   }
   if (!REDIRECT_URI) {
+    const suggestion = suggestUri(req);
+    console.error("Missing REDIRECT_URI. Suggested:", suggestion);
     return res
       .status(500)
-      .send(html("Server not configured: missing REDIRECT_URI", "red", "❌ Server Misconfigured"));
+      .send(html(
+        `
+        Server not configured: missing <code>REDIRECT_URI</code>.<br><br>
+        Set this in <b>Vercel → Project → Settings → Environment Variables (Production)</b><br>
+        <ul>
+          <li>Name: <code>REDIRECT_URI</code></li>
+          <li>Value: <code>${suggestion}</code></li>
+        </ul>
+        Then redeploy and add this exact URL in <b>Facebook Login → Settings → Valid OAuth Redirect URIs</b>.<br><br>
+        <b>Tip:</b> Use the production domain only (avoid preview URLs).`,
+        "red",
+        "❌ Server Misconfigured: REDIRECT_URI"
+      ));
   }
 
   // --- Decode optional state ---
@@ -68,11 +102,11 @@ module.exports = async (req, res) => {
   }
 
   try {
-    // 1) Exchange code -> short-lived token
+    // 1) Exchange code -> short-lived token (Graph v23.0)
     const tokenParams = new URLSearchParams({
       client_id: APP_ID,
       client_secret: APP_SECRET,
-      redirect_uri: REDIRECT_URI,
+      redirect_uri: REDIRECT_URI, // must match the OAuth dialog's redirect_uri exactly
       code
     });
 
@@ -80,17 +114,22 @@ module.exports = async (req, res) => {
     console.log("🔍 Token exchange URL:", tokenUrl);
 
     const tokenResp = await fetch(tokenUrl);
-    const tokenJson = await tokenResp.json();
+    const tokenTxt = await tokenResp.text();
+    let tokenJson;
+    try { tokenJson = JSON.parse(tokenTxt); } catch { tokenJson = { raw: tokenTxt }; }
 
     if (!tokenResp.ok) {
       const msg = tokenJson?.error?.message || "Token exchange failed";
-      console.error("❌ Token exchange error:", msg);
+      console.error("❌ Token exchange error body:", tokenTxt);
       return res
         .status(400)
         .send(html(
-          `Token exchange failed: ${msg}<br><br>Make sure this URL is in your Facebook App's OAuth Redirect URIs:<br><code>${REDIRECT_URI}</code>`,
+          `Token exchange failed: ${msg}<br><br>
+           Ensure this exact URL is configured in <b>Facebook Login → Valid OAuth Redirect URIs</b>:<br>
+           <code>${REDIRECT_URI}</code><br><br>
+           <details><summary>Raw error</summary><pre>${String(tokenTxt).replace(/[<>]/g, "")}</pre></details>`,
           "red",
-          "❌ Connection Failed"
+          "❌ Redirect URI / Token Exchange Error"
         ));
     }
 
@@ -116,7 +155,7 @@ module.exports = async (req, res) => {
       throw new Error(pagesJson?.error?.message || "Failed to fetch pages");
     }
 
-    // 4) Find Instagram business account
+    // 4) Find Instagram Business Account
     let igAccount = null;
     let pageAccessToken = null;
     let igDetails = null;
@@ -139,10 +178,10 @@ module.exports = async (req, res) => {
     }
 
     if (!igAccount) {
-      throw new Error("No Instagram Business Account found. Please connect an Instagram Business Account to a Facebook Page you manage.");
+      throw new Error("No Instagram Business Account found. Connect one to a Facebook Page you manage and try again.");
     }
 
-    // 5) Update your main app
+    // 5) Notify your app
     const payload = {
       client_id: clientId,
       instagram_account_id: igAccount.id,
@@ -151,7 +190,7 @@ module.exports = async (req, res) => {
       instagram_profile_picture_url: igDetails?.profile_picture_url || null
     };
 
-    const updResp = await fetch(ORBIT_UPDATE_URL, {
+    const updResp = await fetch(process.env.ORBIT_UPDATE_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
