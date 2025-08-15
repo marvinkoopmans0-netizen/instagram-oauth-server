@@ -1,0 +1,13 @@
+{	
+  "name": "instagram-oauth-server",
+  "version": "1.0.0",
+  "description": "Instagram OAuth callback handler",
+  "main": "index.js",
+  "scripts": {
+    "dev": "vercel dev",
+    "build": "echo 'No build step required'",
+    "start": "echo 'This is a serverless app'"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}
