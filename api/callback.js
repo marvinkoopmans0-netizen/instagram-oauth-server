@@ -1,35 +1,16 @@
-// /api/callback.js  (Vercel Serverless Function - CommonJS)
+// /api/callback.js
+const { createClient } = require("@base44/sdk");
 
-// HARD-CODE the stable production redirect to avoid preview-domain mismatches.
+// Hardcode stable production redirect
 const REDIRECT_URI = "https://instagram-oauth-server-2ca8.vercel.app/api/callback";
 
 function html(msg, color = "black", title = "Status") {
-  return `
-  <html>
-    <body style="font-family: Arial, sans-serif; text-align:center; padding:40px;">
-      <h1 style="color:${color};">${title}</h1>
-      <div style="max-width:780px;margin:0 auto;text-align:left;">${msg}</div>
-    </body>
-  </html>`;
+  return `<html><body style="font-family:sans-serif;text-align:center;padding:40px;">
+    <h1 style="color:${color};">${title}</h1>
+    <div style="max-width:780px;margin:0 auto;text-align:left;">${msg}</div>
+  </body></html>`;
 }
 
-// Minimal x-www-form-urlencoded / JSON body parser for POST forms
-async function parseForm(req) {
-  const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  const raw = Buffer.concat(chunks).toString("utf8");
-  const ct = (req.headers["content-type"] || "").toLowerCase();
-  if (ct.includes("application/json")) {
-    try { return JSON.parse(raw || "{}"); } catch { return {}; }
-  }
-  // default: x-www-form-urlencoded
-  const params = new URLSearchParams(raw);
-  const out = {};
-  params.forEach((v, k) => { out[k] = v; });
-  return out;
-}
-
-// Fetch helper with basic error surfacing
 async function getJson(url) {
   const r = await fetch(encodeURI(url));
   const t = await r.text();
@@ -38,354 +19,99 @@ async function getJson(url) {
 }
 
 module.exports = async (req, res) => {
-  // --- CORS ---
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") return res.status(200).end();
 
-  const APP_ID = process.env.INSTAGRAM_APP_ID || "774904345078180";
+  const APP_ID = process.env.INSTAGRAM_APP_ID;
   const APP_SECRET = process.env.INSTAGRAM_APP_SECRET;
-  const ORBIT_UPDATE_URL = process.env.ORBIT_UPDATE_URL;
-  const BASE44_API_KEY = process.env.BASE44_API_KEY;
+  const BASE44_APP_ID = process.env.BASE44_APP_ID;
 
-  if (!APP_ID || !APP_SECRET || !ORBIT_UPDATE_URL) {
-    return res.status(500).send(
-      html(
-        "Server not configured: missing <code>INSTAGRAM_APP_ID</code> / <code>INSTAGRAM_APP_SECRET</code> / <code>ORBIT_UPDATE_URL</code>.",
-        "red",
-        "❌ Server Misconfigured"
-      )
-    );
+  if (!APP_ID || !APP_SECRET || !BASE44_APP_ID) {
+    return res.status(500).send(html("Missing env vars", "red", "❌ Server Misconfigured"));
   }
 
-  // ---------- POST: user picked a Page from the picker ----------
-  if (req.method === "POST") {
-    const body = await parseForm(req);
-    const userAccessToken = body.user_token || "";
-    const pickedPageId = body.page_id || "";
-    let clientId = body.client_id || null;
-
-    if (!userAccessToken || !pickedPageId) {
-      return res.status(400).send(html("Missing selection or user token.", "red", "❌ Selection Error"));
-    }
-
-    try {
-      // Re-list pages using USER token (ensures we have fresh page token)
-      const meAccounts = await getJson(`https://graph.facebook.com/v23.0/me/accounts?access_token=${encodeURIComponent(userAccessToken)}`);
-      if (!meAccounts.ok || !Array.isArray(meAccounts.json?.data)) {
-        return res.status(400).send(html(
-          `Could not list pages with user token.<br><pre>${(meAccounts.raw || "").replace(/[<>]/g, "")}</pre>`,
-          "red",
-          "❌ Page Lookup Failed"
-        ));
-      }
-
-      const page = meAccounts.json.data.find(p => p.id === pickedPageId);
-      if (!page || !page.access_token) {
-        return res.status(400).send(html("Selected page not found or missing page token.", "red", "❌ Selection Error"));
-      }
-
-      // Ask for BOTH Business and Creator links using PAGE token
-      const fields = "instagram_business_account,connected_instagram_account,name";
-      const pageInfo = await getJson(
-        `https://graph.facebook.com/v23.0/${page.id}?fields=${fields}&access_token=${encodeURIComponent(page.access_token)}`
-      );
-      if (!pageInfo.ok) {
-        return res.status(400).send(html(
-          `Failed to fetch page IG links.<br><pre>${(pageInfo.raw || "").replace(/[<>]/g, "")}</pre>`,
-          "red",
-          "❌ IG Link Lookup Failed"
-        ));
-      }
-
-      const igId =
-        pageInfo.json?.instagram_business_account?.id ||
-        pageInfo.json?.connected_instagram_account?.id;
-
-      if (!igId) {
-        return res.status(400).send(html(
-          "This Page has no linked Instagram Professional account (Business/Creator). Link one and try again.",
-          "red",
-          "❌ No IG Linked"
-        ));
-      }
-
-      // Optional IG details for UI
-      const igDetails = await getJson(
-        `https://graph.facebook.com/v23.0/${igId}?fields=username,profile_picture_url&access_token=${encodeURIComponent(page.access_token)}`
-      );
-
-      // Notify your main app
-      const payload = {
-        client_id: clientId,
-        instagram_account_id: igId,
-        instagram_access_token: page.access_token,
-        instagram_account_name: igDetails.json?.username || null,
-        instagram_profile_picture_url: igDetails.json?.profile_picture_url || null
-      };
-
-      const updResp = await fetch(ORBIT_UPDATE_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(BASE44_API_KEY ? { Authorization: `Bearer ${BASE44_API_KEY}` } : {})
-        },
-        body: JSON.stringify(payload)
-      });
-
-      if (!updResp.ok) {
-        const t = await updResp.text();
-        return res.status(502).send(html(
-          `Failed to update main app:<br><pre>${(t || "").replace(/[<>]/g, "")}</pre>`,
-          "red",
-          "❌ Upstream Update Failed"
-        ));
-      }
-
-      return res.status(200).send(html(
-        `Instagram account @${igDetails.json?.username || igId} connected successfully. You can close this window.`,
-        "green",
-        "✅ Connected Successfully"
-      ));
-    } catch (e) {
-      console.error("POST picker flow error:", e);
-      return res.status(500).send(html(String(e?.message || e), "red", "❌ Connection Failed"));
-    }
-  }
-
-  // ---------- GET: OAuth redirect with ?code= ----------
-  if (req.method !== "GET") {
-    return res.status(405).json({ error: "method_not_allowed" });
+  // Get user token from Authorization header
+  const authHeader = req.headers.authorization;
+  const userToken = authHeader?.split(" ")[1];
+  if (!userToken) {
+    return res.status(401).send(html("Missing user token in Authorization header", "red", "❌ Unauthorized"));
   }
 
   const { code, state, error } = req.query || {};
-  if (error) {
-    return res.status(400).send(html(`Authorization failed: ${String(error)}`, "red", "❌ Authorization Failed"));
-  }
-  if (!code) {
-    return res.status(400).send(html("Missing authorization code", "red", "❌ Missing Parameters"));
-  }
+  if (error) return res.status(400).send(html(`Authorization failed: ${error}`, "red", "❌ Authorization Failed"));
+  if (!code) return res.status(400).send(html("Missing authorization code", "red", "❌ Missing Parameters"));
 
-  // Optional context
+  // Extract clientId from state
   let clientId = null;
-  if (state) {
-    try { clientId = (JSON.parse(decodeURIComponent(state)) || {}).clientId || null; } catch {}
-  }
+  try { clientId = JSON.parse(decodeURIComponent(state))?.clientId || null; } catch {}
+  if (!clientId) return res.status(400).send(html("Missing clientId in state", "red", "❌ Missing Parameters"));
 
   try {
-    // 1) Exchange code → short‑lived USER token (exact same redirect_uri)
+    // 1) Exchange code → short-lived token
     const tokenParams = new URLSearchParams({
       client_id: APP_ID,
       client_secret: APP_SECRET,
       redirect_uri: REDIRECT_URI,
       code
     });
-    const tokenUrl = `https://graph.facebook.com/v23.0/oauth/access_token?${tokenParams}`;
-    console.log("🔍 Token exchange URL:", tokenUrl);
-
-    const tokenResp = await fetch(tokenUrl);
-    const tokenTxt = await tokenResp.text();
-    let tokenJson; try { tokenJson = JSON.parse(tokenTxt); } catch { tokenJson = { raw: tokenTxt }; }
-    if (!tokenResp.ok) {
-      console.error("❌ Token exchange error body:", tokenTxt);
-      return res.status(400).send(html(
-        `Token exchange failed.<br><br>
-         Ensure this exact URL is in <b>Facebook Login → Valid OAuth Redirect URIs</b>:<br>
-         <code>${REDIRECT_URI}</code><br><br>
-         <details><summary>Raw error</summary><pre>${String(tokenTxt).replace(/[<>]/g, "")}</pre></details>`,
-        "red",
-        "❌ Redirect URI / Token Exchange Error"
-      ));
-    }
+    const tokenRes = await fetch(`https://graph.facebook.com/v23.0/oauth/access_token?${tokenParams}`);
+    const tokenJson = await tokenRes.json();
+    if (!tokenRes.ok) throw new Error(tokenJson?.error?.message || "Token exchange failed");
     let userAccessToken = tokenJson.access_token;
 
-    // 2) DEBUG LOGS: me/permissions and me/accounts (with USER token)
-    const permsResp = await fetch(`https://graph.facebook.com/v23.0/me/permissions?access_token=${encodeURIComponent(userAccessToken)}`);
-    const permsTxt = await permsResp.text();
-    console.log("DEBUG me/permissions:", permsTxt);
-
-    const meAcctsResp = await fetch(`https://graph.facebook.com/v23.0/me/accounts?access_token=${encodeURIComponent(userAccessToken)}`);
-    const meAcctsTxt = await meAcctsResp.text();
-    console.log("DEBUG me/accounts:", meAcctsTxt);
-
-    // 3) Upgrade to long‑lived USER token (optional but recommended)
+    // 2) Long-lived token
     const llParams = new URLSearchParams({
       grant_type: "fb_exchange_token",
       client_id: APP_ID,
       client_secret: APP_SECRET,
       fb_exchange_token: userAccessToken
     });
-    const ll = await getJson(`https://graph.facebook.com/v23.0/oauth/access_token?${llParams}`);
-    if (ll.ok && ll.json?.access_token) userAccessToken = ll.json.access_token;
+    const llRes = await getJson(`https://graph.facebook.com/v23.0/oauth/access_token?${llParams}`);
+    if (llRes.ok && llRes.json?.access_token) userAccessToken = llRes.json.access_token;
 
-    // 4) List Pages with USER token
+    // 3) Get Pages
     const pagesRes = await getJson(`https://graph.facebook.com/v23.0/me/accounts?access_token=${encodeURIComponent(userAccessToken)}`);
-    if (!pagesRes.ok) {
-      return res.status(400).send(html(
-        `Failed to fetch pages.<br><pre>${(pagesRes.raw || "").replace(/[<>]/g, "")}</pre>`,
-        "red",
-        "❌ Pages Fetch Failed"
-      ));
-    }
-    const pages = Array.isArray(pagesRes.json?.data) ? pagesRes.json.data : [];
+    if (!pagesRes.ok || !pagesRes.json?.data?.length) throw new Error("No Pages returned for this user");
 
-    // 4b) If no pages, render re-consent helper with a button (auth_type=rerequest) + debug
-    if (pages.length === 0) {
-      // Build a re-consent URL that forces the user to click "Edit access"
-      const reconsent = new URL("https://www.facebook.com/v23.0/dialog/oauth");
-      reconsent.search = new URLSearchParams({
-        client_id: APP_ID,
-        redirect_uri: REDIRECT_URI,
-        scope: [
-          "pages_show_list",
-          "pages_read_engagement",
-          "pages_manage_metadata",
-          "instagram_basic",
-          "instagram_manage_insights",
-          "instagram_content_publish",
-        ].join(","),
-        response_type: "code",
-        auth_type: "rerequest",
-        state: JSON.stringify({ clientId }) // keep context
-      }).toString();
-
-      // Also show what the token actually has, to debug quickly
-      const perms2Resp = await fetch(`https://graph.facebook.com/v23.0/me/permissions?access_token=${encodeURIComponent(userAccessToken)}`);
-      const perms2Txt = await perms2Resp.text();
-      console.log("DEBUG me/permissions (No Pages branch):", perms2Txt);
-
-      return res.status(400).send(`
-        <html>
-          <body style="font-family: Arial, sans-serif; padding: 28px; max-width: 840px; margin: 0 auto;">
-            <h2 style="margin-top:0;">We kunnen je Facebook-pagina’s niet ophalen</h2>
-            <p>Dit gebeurt wanneer je token geen paginarechten heeft, of wanneer je geen <b>Facebook access: Full control</b> hebt op de pagina.</p>
-            <ol>
-              <li>Klik hieronder op <b>Toegang verlenen</b> en kies <b>Edit access / Toegang bewerken</b>.</li>
-              <li>Vink de juiste <b>Pagina’s</b> én het <b>Instagram-account</b> aan.</li>
-              <li>Probeer daarna opnieuw.</li>
-            </ol>
-
-            <p><a href="${reconsent.toString()}" style="display:inline-block;padding:10px 14px;border:1px solid #ddd;border-radius:8px;text-decoration:none;">🔁 Toegang verlenen</a></p>
-
-            <details style="margin-top:16px;">
-              <summary>Debug: me/permissions</summary>
-              <pre style="white-space:pre-wrap;border:1px solid #eee;padding:12px;border-radius:8px;">${String(perms2Txt).replace(/[<>]/g,"")}</pre>
-            </details>
-
-            <p style="font-size:12px;color:#666;margin-top:10px;">
-              Vereiste permissies: <code>pages_show_list, pages_read_engagement, pages_manage_metadata, instagram_basic</code>.<br>
-              Zorg dat je op de pagina <b>Facebook access: Full control</b> hebt (niet alleen "Task access").
-            </p>
-          </body>
-        </html>
-      `);
-    }
-
-    // 5) Build candidates: Pages that have IG (Business/Creator)
-    const candidates = [];
-    for (const page of pages) {
-      if (!page?.id || !page?.access_token) continue;
-      const fields = "instagram_business_account,connected_instagram_account,name";
+    // 4) Find IG account
+    let igData = null;
+    for (const page of pagesRes.json.data) {
       const pageInfo = await getJson(
-        `https://graph.facebook.com/v23.0/${page.id}?fields=${fields}&access_token=${encodeURIComponent(page.access_token)}`
+        `https://graph.facebook.com/v23.0/${page.id}?fields=instagram_business_account,connected_instagram_account,name&access_token=${encodeURIComponent(page.access_token)}`
       );
-      if (!pageInfo.ok) continue;
-
-      const igId =
-        pageInfo.json?.instagram_business_account?.id ||
-        pageInfo.json?.connected_instagram_account?.id;
-      if (!igId) continue;
-
-      const det = await getJson(
-        `https://graph.facebook.com/v23.0/${igId}?fields=username,profile_picture_url&access_token=${encodeURIComponent(page.access_token)}`
-      );
-
-      candidates.push({
-        pageId: page.id,
-        pageName: pageInfo.json?.name || page.name || page.id,
-        pageToken: page.access_token,
-        igId,
-        igUsername: det.json?.username || null,
-        igAvatar: det.json?.profile_picture_url || null
-      });
-    }
-
-    if (candidates.length === 0) {
-      return res.status(400).send(html(
-        "No Instagram Professional account (Business/Creator) linked to any Page returned for this user. " +
-        "Link your Instagram to a Facebook Page you manage (Page Settings → Linked Accounts → Instagram), " +
-        "ensure the Instagram account is Professional, then re‑try.",
-        "red",
-        "❌ No IG Linked"
-      ));
-    }
-
-    // If exactly one, auto-select; else render a picker that POSTs back with user_token + page_id
-    if (candidates.length === 1) {
-      const c = candidates[0];
-
-      // Finalize: notify your main app using the PAGE token
-      const updResp = await fetch(ORBIT_UPDATE_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(BASE44_API_KEY ? { Authorization: `Bearer ${BASE44_API_KEY}` } : {})
-        },
-        body: JSON.stringify({
-          client_id: clientId,
-          instagram_account_id: c.igId,
-          instagram_access_token: c.pageToken,
-          instagram_account_name: c.igUsername || null,
-          instagram_profile_picture_url: c.igAvatar || null
-        })
-      });
-      if (!updResp.ok) {
-        const t = await updResp.text();
-        return res.status(502).send(html(
-          `Failed to update main app:<br><pre>${(t || "").replace(/[<>]/g, "")}</pre>`,
-          "red",
-          "❌ Upstream Update Failed"
-        ));
+      const igId = pageInfo.json?.instagram_business_account?.id || pageInfo.json?.connected_instagram_account?.id;
+      if (igId) {
+        const igDetails = await getJson(
+          `https://graph.facebook.com/v23.0/${igId}?fields=username,profile_picture_url&access_token=${encodeURIComponent(page.access_token)}`
+        );
+        igData = {
+          instagram_account_id: igId,
+          instagram_access_token: page.access_token,
+          instagram_account_name: igDetails.json?.username || null,
+          instagram_profile_picture_url: igDetails.json?.profile_picture_url || null
+        };
+        break;
       }
-
-      return res.status(200).send(html(
-        `Instagram account @${c.igUsername || c.igId} connected successfully. You can close this window.`,
-        "green",
-        "✅ Connected Successfully"
-      ));
     }
+    if (!igData) throw new Error("No Instagram Business Account linked to any Page");
 
-    // Render picker
-    const items = candidates.map(c => `
-      <li style="margin:12px 0; display:flex; align-items:center; gap:10px;">
-        <img src="${c.igAvatar || ""}" onerror="this.style.display='none'" style="height:32px;width:32px;border-radius:50%;">
-        <div style="flex:1;">
-          <div><b>@${c.igUsername || c.igId}</b></div>
-          <div style="font-size:12px;color:#555;">Page: ${c.pageName} (${c.pageId})</div>
-        </div>
-        <form method="POST" action="/api/callback" style="margin:0;">
-          <input type="hidden" name="page_id" value="${c.pageId}">
-          <input type="hidden" name="user_token" value="${userAccessToken}">
-          <input type="hidden" name="client_id" value="${clientId || ""}">
-          <button type="submit" style="padding:8px 12px;border-radius:8px;border:1px solid #ddd;cursor:pointer;">Kies</button>
-        </form>
-      </li>
-    `).join("");
+    // 5) Update client in Base44
+    const base44 = createClient({ appId: BASE44_APP_ID });
+    base44.auth.setToken(userToken);
+    await base44.entities.Client.update(clientId, {
+      ...igData,
+      instagram_connection_status: "connected"
+    });
 
-    return res.status(200).send(`
-      <html>
-        <body style="font-family: Arial, sans-serif; padding: 28px; max-width: 840px; margin: 0 auto;">
-          <h2 style="margin-top:0;">Kies het Instagram‑account dat je wilt koppelen</h2>
-          <p>We vonden meerdere gekoppelde Instagram Professional accounts. Kies er één om te verbinden.</p>
-          <ul style="list-style:none;padding:0;margin:16px 0;">${items}</ul>
-          <p style="font-size:12px;color:#666;">Tip: als je de juiste pagina/IG niet ziet, klik <b>Terug</b> en log opnieuw in met <i>Toegang bewerken</i> om de juiste pagina/IG te selecteren.</p>
-        </body>
-      </html>
-    `);
-
-  } catch (e) {
-    console.error("OAuth callback error:", e);
-    return res.status(500).send(html(String(e?.message || e), "red", "❌ Connection Failed"));
+    return res.status(200).send(html(
+      `Instagram account @${igData.instagram_account_name || igData.instagram_account_id} connected successfully.`,
+      "green",
+      "✅ Connected Successfully"
+    ));
+  } catch (err) {
+    console.error("OAuth callback error:", err);
+    return res.status(500).send(html(err.message || "Unknown error", "red", "❌ Connection Failed"));
   }
 };
