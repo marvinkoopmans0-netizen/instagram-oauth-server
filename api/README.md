@@ -2,7 +2,7 @@
 
 This is a simple serverless function to handle Instagram OAuth callbacks for the Spacesight app.
 
-## Deployment
+## Deployment t
 
 Deploy to Vercel with environment variables:
 - INSTAGRAM_APP_ID
